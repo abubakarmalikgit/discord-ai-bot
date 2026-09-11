@@ -40,7 +40,7 @@ logger = logging.getLogger("MalixAris-Core")
 logging.getLogger("discord.client").setLevel(logging.ERROR)
 
 # -------------------------------------------------------------
-# 2. Strict Startup Validation
+# 2. Startup Validation
 # -------------------------------------------------------------
 def validate_environment():
     missing = []
@@ -52,9 +52,17 @@ def validate_environment():
     if missing:
         logger.critical("=" * 60)
         logger.critical(f"FATAL: Missing required env vars: {', '.join(missing)}")
-        logger.critical("Go to Render → your service → Environment tab and set them.")
         logger.critical("=" * 60)
         sys.exit(1)
+
+    if AI_API_KEY and not AI_API_KEY.startswith("nvapi-"):
+        logger.warning("=" * 60)
+        logger.warning("⚠️  Your AI_API_KEY does NOT start with 'nvapi-'.")
+        logger.warning("NVIDIA integrate.api.nvidia.com requires a 'Personal API Key'")
+        logger.warning("from https://build.nvidia.com/settings/api-keys")
+        logger.warning("Old-style/org keys often return 404 'Not found for account'")
+        logger.warning("for EVERY model, even ones that work in the playground.")
+        logger.warning("=" * 60)
 
     logger.info(f"AI_API_BASE_URL = {AI_API_BASE_URL}")
     logger.info(f"AI_MODEL_NAME (hint only) = {AI_MODEL_NAME or '(none — auto-detect)'}")
@@ -66,14 +74,17 @@ validate_environment()
 # -------------------------------------------------------------
 # 3. Live Discord Log Streaming
 #
-#    Every logger.info/warning/error call anywhere in this file
-#    gets buffered here (thread-safe) and shipped in batches to
-#    an admin-configured Discord channel. Only OUR logger
-#    ("MalixAris-Core") is hooked — discord.py's internal
-#    loggers are NOT attached, which prevents infinite
-#    send-a-message -> log-the-http-call -> send-a-message loops.
+#    Real-time-as-possible without triggering Discord rate
+#    limits: buffer is flushed every 1.5s (not 5s). True
+#    instant per-line streaming is intentionally avoided —
+#    if the bot logs 50+ lines/sec during an incident (e.g.
+#    a probe storm like your logs showed), per-line sends
+#    would get hard rate-limited or banned by Discord. This
+#    is the same batching strategy used by production
+#    observability tools (Datadog, Sentry, etc.) for Discord
+#    webhooks.
 # -------------------------------------------------------------
-log_buffer = deque(maxlen=500)
+log_buffer = deque(maxlen=1000)
 log_buffer_lock = threading.Lock()
 
 class DiscordLogHandler(logging.Handler):
@@ -83,7 +94,7 @@ class DiscordLogHandler(logging.Handler):
             with log_buffer_lock:
                 log_buffer.append((record.levelno, msg))
         except Exception:
-            pass  # never let logging itself crash the app
+            pass
 
 _discord_log_handler = DiscordLogHandler()
 _discord_log_handler.setLevel(logging.INFO)
@@ -92,12 +103,6 @@ logger.addHandler(_discord_log_handler)
 
 # -------------------------------------------------------------
 # 4. Persistent Settings Store
-#
-#    Fixes a real production bug: everything (premium users,
-#    blacklist, personas, log channel) was ONLY in RAM before,
-#    meaning every Render restart/redeploy silently wiped it.
-#    This saves to a JSON file on every change and reloads it
-#    at boot.
 # -------------------------------------------------------------
 def _load_data() -> dict:
     if os.path.exists(DATA_FILE):
@@ -158,7 +163,66 @@ threading.Thread(target=run_health_server, daemon=True).start()
 logger.info(f"Health check server bound on 0.0.0.0:{PORT}")
 
 # -------------------------------------------------------------
-# 6. Dynamic Model Discovery Engine
+# 6. API Key Diagnostic Engine
+#
+#    Distinguishes between the DIFFERENT failure modes that
+#    look similar but mean completely different things:
+#    - 401/403 = key itself is invalid/unauthorized entirely
+#    - 404 "Not found for account" = key is VALID but has
+#      zero entitlement to that specific model (often means
+#      wrong key TYPE — legacy vs personal key)
+#    - 410 = model permanently retired by NVIDIA for everyone
+#    - Timeout = network/NVIDIA-side issue, not a key problem
+# -------------------------------------------------------------
+def run_key_diagnostic() -> dict:
+    result = {
+        "key_prefix_ok": AI_API_KEY.startswith("nvapi-"),
+        "auth_status": None,
+        "sample_model_status": None,
+        "sample_model_detail": "",
+        "verdict": "",
+    }
+
+    # Step 1: does auth work AT ALL? /models should work for ANY valid key.
+    try:
+        resp = requests.get(
+            f"{AI_API_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {AI_API_KEY}"},
+            timeout=10
+        )
+        result["auth_status"] = resp.status_code
+    except Exception as e:
+        result["auth_status"] = f"exception: {e}"
+
+    # Step 2: try one universally-known model to classify the failure type
+    try:
+        resp2 = requests.post(
+            f"{AI_API_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "meta/llama-3.1-8b-instruct", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
+            timeout=10
+        )
+        result["sample_model_status"] = resp2.status_code
+        result["sample_model_detail"] = resp2.text[:300]
+    except Exception as e:
+        result["sample_model_status"] = "exception"
+        result["sample_model_detail"] = str(e)
+
+    if result["auth_status"] in (401, 403):
+        result["verdict"] = "🔴 INVALID KEY — the key itself is rejected. Regenerate it at build.nvidia.com."
+    elif not result["key_prefix_ok"]:
+        result["verdict"] = "🟠 WRONG KEY TYPE — key doesn't start with 'nvapi-'. Generate a Personal API Key at build.nvidia.com/settings/api-keys."
+    elif result["sample_model_status"] == 404:
+        result["verdict"] = "🟠 ZERO MODEL ENTITLEMENTS — key is valid but can't access any chat model. Almost always means it's a legacy/org key instead of a Personal API Key."
+    elif result["sample_model_status"] == 200:
+        result["verdict"] = "🟢 KEY IS WORKING — this specific model responded successfully."
+    else:
+        result["verdict"] = f"🟡 UNCLEAR — got HTTP {result['sample_model_status']}, inspect detail manually."
+
+    return result
+
+# -------------------------------------------------------------
+# 7. Dynamic Model Discovery Engine
 # -------------------------------------------------------------
 ACTIVE_ENGINE = AI_MODEL_NAME or "auto-detecting..."
 _engine_lock = threading.Lock()
@@ -189,7 +253,7 @@ SPEED_PRIORITY_KEYWORDS = [
     "granite-3", "phi-3.5",
 ]
 
-MAX_PROBE_ATTEMPTS = 25
+MAX_PROBE_ATTEMPTS = 20
 
 def fetch_live_model_catalog() -> List[str]:
     url = f"{AI_API_BASE_URL}/models"
@@ -199,7 +263,7 @@ def fetch_live_model_catalog() -> List[str]:
         if resp.status_code == 200:
             data = resp.json()
             ids = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
-            logger.info(f"Live catalog fetched: {len(ids)} models listed.")
+            logger.info(f"Live catalog fetched: {len(ids)} models listed (NOTE: this lists NVIDIA's FULL catalog, not just models your key can use).")
             return ids
         logger.warning(f"Catalog fetch failed (HTTP {resp.status_code}): {resp.text[:200]}")
     except Exception as e:
@@ -289,7 +353,10 @@ def _select_verified_model_blocking() -> str:
                 logger.info(f"🚀 Locked onto verified engine: {ACTIVE_ENGINE}")
                 return ACTIVE_ENGINE
 
-        logger.error("All model probes failed. No live engine found.")
+        logger.critical(
+            "ALL model probes failed with zero successes. This almost always means your "
+            "AI_API_KEY lacks entitlement to ANY chat model — run /diagnose for a full breakdown."
+        )
         return ACTIVE_ENGINE
     finally:
         _verification_running.clear()
@@ -298,7 +365,7 @@ def start_model_verification_async():
     threading.Thread(target=_select_verified_model_blocking, daemon=True).start()
 
 # -------------------------------------------------------------
-# 7. Discord Bot Setup & In-Memory Stores
+# 8. Discord Bot Setup & In-Memory Stores
 # -------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -394,7 +461,7 @@ async def send_chunked(interaction_or_channel, reply: str, is_interaction: bool 
         first = False
 
 # -------------------------------------------------------------
-# 8. Chat Completion Pipeline
+# 9. Chat Completion Pipeline
 # -------------------------------------------------------------
 def fetch_completion(messages: list) -> str:
     global ACTIVE_ENGINE
@@ -484,7 +551,7 @@ async def execute_chat_pipeline(user: discord.User, channel, prompt: str) -> str
         return f"⚠️ **Backend Issue:** `{e}`"
 
 # -------------------------------------------------------------
-# 9. Core Chat Slash Commands
+# 10. Core Chat Slash Commands
 # -------------------------------------------------------------
 @bot.tree.command(name="chat", description="Chat with 𝐌𝐚𝐥𝐢𝐱𝐀𝐫𝐢𝐬 AI")
 @app_commands.describe(prompt="Your message")
@@ -535,8 +602,29 @@ async def engine_cmd(interaction: discord.Interaction):
     new_engine = await asyncio.to_thread(_select_verified_model_blocking)
     await interaction.followup.send(f"🔄 Re-verified. Active engine is now: `{new_engine}`", ephemeral=True)
 
+@bot.tree.command(name="diagnose", description="Run a full NVIDIA API key diagnostic (Admin only)")
+async def diagnose_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    result = await asyncio.to_thread(run_key_diagnostic)
+
+    embed = discord.Embed(title="🔬 NVIDIA API Key Diagnostic", color=discord.Color.purple())
+    embed.add_field(name="Key format looks correct (starts with nvapi-)", value="✅ Yes" if result["key_prefix_ok"] else "❌ No", inline=False)
+    embed.add_field(name="/models endpoint status", value=str(result["auth_status"]), inline=True)
+    embed.add_field(name="Sample chat model status", value=str(result["sample_model_status"]), inline=True)
+    embed.add_field(name="Sample response detail", value=f"```{result['sample_model_detail'][:500]}```", inline=False)
+    embed.add_field(name="Verdict", value=result["verdict"], inline=False)
+    embed.add_field(
+        name="Fix",
+        value="Go to https://build.nvidia.com/settings/api-keys and generate a **Personal API Key**, then update `AI_API_KEY` in Render.",
+        inline=False
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 # -------------------------------------------------------------
-# 10. Moderation / Server Admin Commands
+# 11. Moderation / Server Admin Commands
 # -------------------------------------------------------------
 @bot.tree.command(name="clear", description="Bulk purge chat messages (Staff only)")
 @app_commands.describe(count="Number of messages to delete (1-100)")
@@ -561,7 +649,7 @@ async def setdailylimit_cmd(interaction: discord.Interaction, limit: int):
     await interaction.response.send_message(f"✅ Daily limit for this server set to **{limit}** messages/user.", ephemeral=True)
 
 # -------------------------------------------------------------
-# 11. User Management Commands
+# 12. User Management Commands
 # -------------------------------------------------------------
 @bot.tree.command(name="add_premium", description="Grant a user unlimited quota access (Admin only)")
 @app_commands.describe(user="User to upgrade")
@@ -619,27 +707,73 @@ async def userinfo_cmd(interaction: discord.Interaction, user: discord.User):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -------------------------------------------------------------
-# 12. Logging & Monitoring Commands
+# 13. Logging & Monitoring Commands
+#
+#     Strict single-channel enforcement:
+#     - Verifies bot has Send Messages + Embed Links in the
+#       target channel BEFORE accepting it
+#     - Sends a live test message to confirm it actually works
+#     - The shipper NEVER falls back to another channel — if
+#       the bound channel breaks, it disables itself instead
 # -------------------------------------------------------------
+_log_failure_streak = 0
+MAX_LOG_FAILURES_BEFORE_DISABLE = 3
+
 @bot.tree.command(name="setlogchannel", description="Stream all bot logs live into this (or a chosen) channel (Admin only)")
 @app_commands.describe(channel="Target channel (defaults to the current channel)")
 async def setlogchannel_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    global log_channel_id, _log_failure_streak
+
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
         return
-    global log_channel_id
+
     target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message("❌ Please choose a standard text channel.", ephemeral=True)
+        return
+
+    perms = target.permissions_for(target.guild.me)
+    if not perms.send_messages or not perms.embed_links:
+        await interaction.response.send_message(
+            f"❌ I'm missing permissions in {target.mention}. I need **Send Messages** and "
+            f"**Embed Links** there. Grant those and try again — I will NOT log to any other channel.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        test_embed = discord.Embed(
+            description="✅ **Live log stream connected.** Real-time bot logs will appear here from now on.",
+            color=discord.Color.green()
+        )
+        await target.send(embed=test_embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"❌ Permission flags looked fine but Discord still blocked the send in {target.mention} "
+            f"(check channel-specific permission overwrites).",
+            ephemeral=True
+        )
+        return
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to verify channel: {e}", ephemeral=True)
+        return
+
     log_channel_id = target.id
+    _log_failure_streak = 0
     await save_data()
-    await interaction.response.send_message(f"📡 Live log stream bound to {target.mention}.", ephemeral=True)
-    logger.info(f"Log channel configured by {interaction.user} -> #{getattr(target, 'name', target.id)}")
+    await interaction.response.send_message(
+        f"📡 Live log stream bound to {target.mention}. This is now the ONLY channel that will ever receive logs.",
+        ephemeral=True
+    )
+    logger.info(f"Log channel configured by {interaction.user} -> #{target.name}")
 
 @bot.tree.command(name="removelogchannel", description="Disable the live log stream (Admin only)")
 async def removelogchannel_cmd(interaction: discord.Interaction):
+    global log_channel_id
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
         return
-    global log_channel_id
     log_channel_id = None
     await save_data()
     await interaction.response.send_message("🔕 Log stream disabled.", ephemeral=True)
@@ -688,15 +822,15 @@ async def dashboard_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -------------------------------------------------------------
-# 13. System / Owner Commands
+# 14. System / Owner Commands
 # -------------------------------------------------------------
-@bot.tree.command(name="maintenance", description="Toggle maintenance mode — restricts the bot to admins only (Admin only)")
+@bot.tree.command(name="maintenance", description="Toggle maintenance mode (Admin only)")
 @app_commands.describe(enabled="True to enable, False to disable")
 async def maintenance_cmd(interaction: discord.Interaction, enabled: bool):
+    global maintenance_mode
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
         return
-    global maintenance_mode
     maintenance_mode = enabled
     await save_data()
     status = "🔧 **ENABLED**" if enabled else "✅ **DISABLED**"
@@ -734,13 +868,13 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="💬 Chat", value="`/chat` `/ask` `/reset`", inline=False)
     embed.add_field(name="🛠️ Server Admin", value="`/persona` `/setdailylimit` `/clear`", inline=False)
     embed.add_field(name="👑 User Management", value="`/add_premium` `/remove_premium` `/blacklist` `/unblacklist` `/userinfo`", inline=False)
-    embed.add_field(name="📊 Monitoring", value="`/stats` `/dashboard` `/ping` `/engine`", inline=False)
+    embed.add_field(name="📊 Monitoring", value="`/stats` `/dashboard` `/ping` `/engine` `/diagnose`", inline=False)
     embed.add_field(name="📡 Logging", value="`/setlogchannel` `/removelogchannel`", inline=False)
     embed.add_field(name="⚙️ System (Owner)", value="`/maintenance` `/broadcast`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -------------------------------------------------------------
-# 14. Global Slash Command Error Handler
+# 15. Global Slash Command Error Handler
 # -------------------------------------------------------------
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -756,7 +890,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 # -------------------------------------------------------------
-# 15. Event Handling & Channel Auto-Chat
+# 16. Event Handling & Channel Auto-Chat
 # -------------------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
@@ -801,7 +935,7 @@ async def on_guild_remove(guild: discord.Guild):
     asyncio.create_task(save_data())
 
 # -------------------------------------------------------------
-# 16. Background Tasks
+# 17. Background Tasks
 # -------------------------------------------------------------
 LEVEL_COLORS = {
     logging.DEBUG: discord.Color.light_grey(),
@@ -811,8 +945,14 @@ LEVEL_COLORS = {
     logging.CRITICAL: discord.Color.dark_red(),
 }
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=1.5)
 async def log_shipper_task():
+    """Near-real-time log forwarding. Batches every 1.5s to stay
+    well clear of Discord's rate limits during error bursts.
+    Only ever posts to the single configured channel — never
+    falls back elsewhere. Auto-disables after repeated failures."""
+    global log_channel_id, _log_failure_streak
+
     if not log_channel_id:
         return
 
@@ -827,19 +967,41 @@ async def log_shipper_task():
         try:
             channel = await bot.fetch_channel(log_channel_id)
         except Exception:
+            _log_failure_streak += 1
+            if _log_failure_streak >= MAX_LOG_FAILURES_BEFORE_DISABLE:
+                logger.error("Log channel unreachable — auto-disabling log stream.")
+                log_channel_id = None
+                _log_failure_streak = 0
+                asyncio.create_task(save_data())
             return
+
+    perms = channel.permissions_for(channel.guild.me) if hasattr(channel, "guild") else None
+    if perms and (not perms.send_messages or not perms.embed_links):
+        _log_failure_streak += 1
+        if _log_failure_streak >= MAX_LOG_FAILURES_BEFORE_DISABLE:
+            logger.error("Lost permissions in log channel — auto-disabling log stream.")
+            log_channel_id = None
+            _log_failure_streak = 0
+            asyncio.create_task(save_data())
+        return
 
     worst_level = max(lvl for lvl, _ in items)
     color = LEVEL_COLORS.get(worst_level, discord.Color.blue())
     combined = "\n".join(msg for _, msg in items)
 
-    for i in range(0, len(combined), 3900):
-        chunk = combined[i:i + 3900]
-        embed = discord.Embed(description=f"```{chunk}```", color=color)
-        try:
+    try:
+        for i in range(0, len(combined), 3900):
+            chunk = combined[i:i + 3900]
+            embed = discord.Embed(description=f"```{chunk}```", color=color)
             await channel.send(embed=embed)
-        except Exception:
-            break
+        _log_failure_streak = 0
+    except Exception:
+        _log_failure_streak += 1
+        if _log_failure_streak >= MAX_LOG_FAILURES_BEFORE_DISABLE:
+            logger.error("Repeated send failures in log channel — auto-disabling log stream.")
+            log_channel_id = None
+            _log_failure_streak = 0
+            asyncio.create_task(save_data())
 
 @tasks.loop(minutes=20)
 async def cleanup_task():
