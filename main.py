@@ -52,6 +52,7 @@ def validate_environment():
     if missing:
         logger.critical("=" * 60)
         logger.critical(f"FATAL: Missing required env vars: {', '.join(missing)}")
+        logger.critical("Go to Render → your service → Environment tab and set them.")
         logger.critical("=" * 60)
         sys.exit(1)
 
@@ -74,15 +75,10 @@ validate_environment()
 # -------------------------------------------------------------
 # 3. Live Discord Log Streaming
 #
-#    Real-time-as-possible without triggering Discord rate
-#    limits: buffer is flushed every 1.5s (not 5s). True
-#    instant per-line streaming is intentionally avoided —
-#    if the bot logs 50+ lines/sec during an incident (e.g.
-#    a probe storm like your logs showed), per-line sends
-#    would get hard rate-limited or banned by Discord. This
-#    is the same batching strategy used by production
-#    observability tools (Datadog, Sentry, etc.) for Discord
-#    webhooks.
+#    Batches every 1.5s to stay clear of Discord rate limits
+#    during error bursts (e.g. a probe storm). Only ships to
+#    a single admin-configured channel — never falls back
+#    elsewhere. Auto-disables itself after repeated failures.
 # -------------------------------------------------------------
 log_buffer = deque(maxlen=1000)
 log_buffer_lock = threading.Lock()
@@ -121,6 +117,7 @@ guild_personas: Dict[int, str] = {int(k): v for k, v in _persisted.get("guild_pe
 blacklisted_users: Set[int] = set(_persisted.get("blacklisted_users", []))
 maintenance_mode: bool = _persisted.get("maintenance_mode", False)
 guild_daily_limits: Dict[int, int] = {int(k): v for k, v in _persisted.get("guild_daily_limits", {}).items()}
+locked_model: Optional[str] = _persisted.get("locked_model")
 
 def _save_data_sync():
     payload = {
@@ -130,6 +127,7 @@ def _save_data_sync():
         "blacklisted_users": list(blacklisted_users),
         "maintenance_mode": maintenance_mode,
         "guild_daily_limits": {str(k): v for k, v in guild_daily_limits.items()},
+        "locked_model": locked_model,
     }
     try:
         tmp_path = DATA_FILE + ".tmp"
@@ -164,15 +162,6 @@ logger.info(f"Health check server bound on 0.0.0.0:{PORT}")
 
 # -------------------------------------------------------------
 # 6. API Key Diagnostic Engine
-#
-#    Distinguishes between the DIFFERENT failure modes that
-#    look similar but mean completely different things:
-#    - 401/403 = key itself is invalid/unauthorized entirely
-#    - 404 "Not found for account" = key is VALID but has
-#      zero entitlement to that specific model (often means
-#      wrong key TYPE — legacy vs personal key)
-#    - 410 = model permanently retired by NVIDIA for everyone
-#    - Timeout = network/NVIDIA-side issue, not a key problem
 # -------------------------------------------------------------
 def run_key_diagnostic() -> dict:
     result = {
@@ -183,7 +172,6 @@ def run_key_diagnostic() -> dict:
         "verdict": "",
     }
 
-    # Step 1: does auth work AT ALL? /models should work for ANY valid key.
     try:
         resp = requests.get(
             f"{AI_API_BASE_URL}/models",
@@ -194,13 +182,12 @@ def run_key_diagnostic() -> dict:
     except Exception as e:
         result["auth_status"] = f"exception: {e}"
 
-    # Step 2: try one universally-known model to classify the failure type
     try:
         resp2 = requests.post(
             f"{AI_API_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
             json={"model": "meta/llama-3.1-8b-instruct", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
-            timeout=10
+            timeout=15
         )
         result["sample_model_status"] = resp2.status_code
         result["sample_model_detail"] = resp2.text[:300]
@@ -222,9 +209,15 @@ def run_key_diagnostic() -> dict:
     return result
 
 # -------------------------------------------------------------
-# 7. Dynamic Model Discovery Engine
+# 7. Dynamic Model Discovery Engine (+ Locked Model Override)
+#
+#    If `locked_model` is set (via /setmodel), discovery is
+#    SKIPPED ENTIRELY on every boot — no probe sweep, no
+#    wasted API calls, instant startup. Discovery only runs
+#    if no model is locked, or if the locked model itself
+#    fails during a real request.
 # -------------------------------------------------------------
-ACTIVE_ENGINE = AI_MODEL_NAME or "auto-detecting..."
+ACTIVE_ENGINE = locked_model or AI_MODEL_NAME or "auto-detecting..."
 _engine_lock = threading.Lock()
 _verification_running = threading.Event()
 _known_bad_models: Set[str] = set()
@@ -263,7 +256,7 @@ def fetch_live_model_catalog() -> List[str]:
         if resp.status_code == 200:
             data = resp.json()
             ids = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
-            logger.info(f"Live catalog fetched: {len(ids)} models listed (NOTE: this lists NVIDIA's FULL catalog, not just models your key can use).")
+            logger.info(f"Live catalog fetched: {len(ids)} models listed.")
             return ids
         logger.warning(f"Catalog fetch failed (HTTP {resp.status_code}): {resp.text[:200]}")
     except Exception as e:
@@ -309,18 +302,30 @@ def probe_model(model_name: str) -> bool:
         "temperature": 0.1
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code == 200:
             return True
+        # Only permanently blacklist REAL failures (dead/no-access model),
+        # never a transient timeout.
         if resp.status_code in (404, 410):
             _known_bad_models.add(model_name)
         logger.warning(f"Probe failed for {model_name} (HTTP {resp.status_code}): {resp.text[:200]}")
+    except requests.exceptions.Timeout:
+        logger.warning(f"Probe timeout for {model_name} — not blacklisting, could be transient.")
     except Exception as e:
         logger.warning(f"Probe exception for {model_name}: {e}")
     return False
 
 def _select_verified_model_blocking() -> str:
     global ACTIVE_ENGINE
+
+    # Locked model always wins — zero discovery overhead.
+    if locked_model:
+        with _engine_lock:
+            ACTIVE_ENGINE = locked_model
+        logger.info(f"🔒 Using locked model (no discovery needed): {ACTIVE_ENGINE}")
+        return ACTIVE_ENGINE
+
     if _verification_running.is_set():
         logger.info("Verification already running elsewhere — skipping duplicate.")
         return ACTIVE_ENGINE
@@ -598,9 +603,57 @@ async def engine_cmd(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
         return
+    if locked_model:
+        await interaction.response.send_message(
+            f"🔒 A model is locked (`{locked_model}`) — discovery is skipped. Run `/unlockmodel` first if you want to re-scan.",
+            ephemeral=True
+        )
+        return
     await interaction.response.defer(ephemeral=True)
     new_engine = await asyncio.to_thread(_select_verified_model_blocking)
     await interaction.followup.send(f"🔄 Re-verified. Active engine is now: `{new_engine}`", ephemeral=True)
+
+@bot.tree.command(name="setmodel", description="Permanently lock a specific model — skips all future discovery (Admin only)")
+@app_commands.describe(model="Exact model ID, e.g. meta/llama-3.1-8b-instruct")
+async def setmodel_cmd(interaction: discord.Interaction, model: str):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
+        return
+
+    global locked_model, ACTIVE_ENGINE
+    await interaction.response.defer(ephemeral=True)
+
+    works = await asyncio.to_thread(probe_model, model)
+    if not works:
+        await interaction.followup.send(
+            f"❌ `{model}` failed a live test call — not locking it. Run `/diagnose` first to find a working model.",
+            ephemeral=True
+        )
+        return
+
+    locked_model = model
+    ACTIVE_ENGINE = model
+    await save_data()
+    await interaction.followup.send(
+        f"🔒 **Locked!** `{model}` is now the permanent default engine.\n"
+        f"Discovery sweeps are now skipped entirely on every future restart.",
+        ephemeral=True
+    )
+    logger.info(f"Model manually locked by {interaction.user}: {model}")
+
+@bot.tree.command(name="unlockmodel", description="Remove the locked model and re-enable auto-discovery (Admin only)")
+async def unlockmodel_cmd(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin privileges required.", ephemeral=True)
+        return
+    global locked_model
+    locked_model = None
+    await save_data()
+    await interaction.response.send_message(
+        "🔓 Model unlocked — full discovery will run again on next restart or `/engine`.",
+        ephemeral=True
+    )
+    logger.info(f"Model lock removed by {interaction.user}")
 
 @bot.tree.command(name="diagnose", description="Run a full NVIDIA API key diagnostic (Admin only)")
 async def diagnose_cmd(interaction: discord.Interaction):
@@ -708,13 +761,6 @@ async def userinfo_cmd(interaction: discord.Interaction, user: discord.User):
 
 # -------------------------------------------------------------
 # 13. Logging & Monitoring Commands
-#
-#     Strict single-channel enforcement:
-#     - Verifies bot has Send Messages + Embed Links in the
-#       target channel BEFORE accepting it
-#     - Sends a live test message to confirm it actually works
-#     - The shipper NEVER falls back to another channel — if
-#       the bound channel breaks, it disables itself instead
 # -------------------------------------------------------------
 _log_failure_streak = 0
 MAX_LOG_FAILURES_BEFORE_DISABLE = 3
@@ -804,12 +850,13 @@ async def dashboard_cmd(interaction: discord.Interaction):
     mins, secs = divmod(rem, 60)
 
     log_channel_display = f"<#{log_channel_id}>" if log_channel_id else "❌ Not configured"
+    model_display = f"🔒 `{locked_model}` (locked)" if locked_model else f"🔄 `{ACTIVE_ENGINE}` (auto-discovery)"
 
     embed = discord.Embed(title="🧭 𝐌𝐚𝐥𝐢𝐱𝐀𝐫𝐢𝐬 AI — Operations Dashboard", color=discord.Color.gold())
     embed.add_field(name="🌐 Guilds", value=str(len(bot.guilds)), inline=True)
     embed.add_field(name="⏱️ Uptime", value=f"{hours}h {mins}m {secs}s", inline=True)
     embed.add_field(name="📶 Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="🚀 Active Engine", value=f"`{ACTIVE_ENGINE}`", inline=False)
+    embed.add_field(name="🚀 Active Engine", value=model_display, inline=False)
     embed.add_field(name="💬 Total Requests", value=str(stats_tracker["total_requests"]), inline=True)
     embed.add_field(name="✅ Completions", value=str(stats_tracker["successful_completions"]), inline=True)
     embed.add_field(name="⚠️ Failed", value=str(stats_tracker["failed_requests"]), inline=True)
@@ -869,6 +916,7 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="🛠️ Server Admin", value="`/persona` `/setdailylimit` `/clear`", inline=False)
     embed.add_field(name="👑 User Management", value="`/add_premium` `/remove_premium` `/blacklist` `/unblacklist` `/userinfo`", inline=False)
     embed.add_field(name="📊 Monitoring", value="`/stats` `/dashboard` `/ping` `/engine` `/diagnose`", inline=False)
+    embed.add_field(name="🚀 Model Control", value="`/setmodel` `/unlockmodel`", inline=False)
     embed.add_field(name="📡 Logging", value="`/setlogchannel` `/removelogchannel`", inline=False)
     embed.add_field(name="⚙️ System (Owner)", value="`/maintenance` `/broadcast`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -947,10 +995,6 @@ LEVEL_COLORS = {
 
 @tasks.loop(seconds=1.5)
 async def log_shipper_task():
-    """Near-real-time log forwarding. Batches every 1.5s to stay
-    well clear of Discord's rate limits during error bursts.
-    Only ever posts to the single configured channel — never
-    falls back elsewhere. Auto-disables after repeated failures."""
     global log_channel_id, _log_failure_streak
 
     if not log_channel_id:
@@ -1024,9 +1068,18 @@ async def cleanup_task():
 
 @tasks.loop(minutes=30)
 async def engine_health_check():
+    """Even locked models get periodically health-checked — if a
+    locked model dies (retired/revoked), auto-discovery kicks in
+    as a safety net rather than the bot going permanently silent."""
+    global locked_model
     is_alive = await asyncio.to_thread(probe_model, ACTIVE_ENGINE)
     if not is_alive:
-        logger.warning(f"Active engine {ACTIVE_ENGINE} went down. Re-running discovery...")
+        if locked_model:
+            logger.warning(f"Locked model {locked_model} went down. Falling back to auto-discovery.")
+            locked_model = None
+            await save_data()
+        else:
+            logger.warning(f"Active engine {ACTIVE_ENGINE} went down. Re-running discovery...")
         await asyncio.to_thread(_select_verified_model_blocking)
 
 @bot.event
